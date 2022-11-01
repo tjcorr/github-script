@@ -13351,8 +13351,11 @@ var glob = __webpack_require__(90);
 // EXTERNAL MODULE: ./node_modules/@actions/io/lib/io.js
 var io = __webpack_require__(436);
 
+// EXTERNAL MODULE: ./node_modules/@octokit/plugin-paginate-graphql/dist-node/index.js
+var dist_node = __webpack_require__(883);
+
 // EXTERNAL MODULE: ./node_modules/@octokit/plugin-retry/dist-node/index.js
-var dist_node = __webpack_require__(745);
+var plugin_retry_dist_node = __webpack_require__(745);
 
 // CONCATENATED MODULE: ./src/async-function.ts
 const AsyncFunction = Object.getPrototypeOf(async () => null).constructor;
@@ -13429,6 +13432,7 @@ const wrapRequire = new Proxy(require, {
 
 
 
+
 process.on('unhandledRejection', handleError);
 main().catch(handleError);
 async function main() {
@@ -13450,7 +13454,7 @@ async function main() {
         opts.retry = retryOpts;
     if (requestOpts)
         opts.request = requestOpts;
-    const github = Object(lib_github.getOctokit)(token, opts, dist_node.retry);
+    const github = Object(lib_github.getOctokit)(token, opts, plugin_retry_dist_node.retry, dist_node.paginateGraphql);
     const script = Object(core.getInput)('script', { required: true });
     // Using property/value shorthand on `require` (e.g. `{require}`) causes compilation errors.
     const result = await callAsyncFunction({
@@ -13688,6 +13692,212 @@ conversions["RegExp"] = function (V, opts) {
 /***/ (function(module) {
 
 module.exports = eval("require")("encoding");
+
+
+/***/ }),
+
+/***/ 883:
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+
+Object.defineProperty(exports, '__esModule', { value: true });
+
+// Todo: Add link to explanation
+const generateMessage = (path, cursorValue) => `The cursor at "${path.join(",")}" did not change its value "${cursorValue}" after a page transition. Please make sure your that your query is set up correctly.`;
+
+class MissingCursorChange extends Error {
+  constructor(pageInfo, cursorValue) {
+    super(generateMessage(pageInfo.pathInQuery, cursorValue));
+    this.pageInfo = pageInfo;
+    this.cursorValue = cursorValue;
+    this.name = "MissingCursorChangeError";
+
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, this.constructor);
+    }
+  }
+
+}
+
+class MissingPageInfo extends Error {
+  constructor(response) {
+    super(`No pageInfo property found in response. Please make sure to specify the pageInfo in your query. Response-Data: ${JSON.stringify(response, null, 2)}`);
+    this.response = response;
+    this.name = "MissingPageInfo";
+
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, this.constructor);
+    }
+  }
+
+}
+
+const isObject = value => Object.prototype.toString.call(value) === "[object Object]";
+
+function findPaginatedResourcePath(responseData) {
+  const paginatedResourcePath = deepFindPathToProperty(responseData, "pageInfo");
+
+  if (paginatedResourcePath.length === 0) {
+    throw new MissingPageInfo(responseData);
+  }
+
+  return paginatedResourcePath;
+}
+
+const deepFindPathToProperty = (object, searchProp, path = []) => {
+  for (const key of Object.keys(object)) {
+    const currentPath = [...path, key];
+    const currentValue = object[key];
+
+    if (currentValue.hasOwnProperty(searchProp)) {
+      return currentPath;
+    }
+
+    if (isObject(currentValue)) {
+      const result = deepFindPathToProperty(currentValue, searchProp, currentPath);
+
+      if (result.length > 0) {
+        return result;
+      }
+    }
+  }
+
+  return [];
+};
+/**
+ * The interfaces of the "get" and "set" functions are equal to those of lodash:
+ * https://lodash.com/docs/4.17.15#get
+ * https://lodash.com/docs/4.17.15#set
+ *
+ * They are cut down to our purposes, but could be replaced by the lodash calls
+ * if we ever want to have that dependency.
+ */
+
+
+const get = (object, path) => {
+  return path.reduce((current, nextProperty) => current[nextProperty], object);
+};
+
+const set = (object, path, mutator) => {
+  const lastProperty = path[path.length - 1];
+  const parentPath = [...path].slice(0, -1);
+  const parent = get(object, parentPath);
+
+  if (typeof mutator === "function") {
+    parent[lastProperty] = mutator(parent[lastProperty]);
+  } else {
+    parent[lastProperty] = mutator;
+  }
+};
+
+const extractPageInfos = responseData => {
+  const pageInfoPath = findPaginatedResourcePath(responseData);
+  return {
+    pathInQuery: pageInfoPath,
+    pageInfo: get(responseData, [...pageInfoPath, "pageInfo"])
+  };
+};
+
+const isForwardSearch = givenPageInfo => {
+  return givenPageInfo.hasOwnProperty("hasNextPage");
+};
+
+const getCursorFrom = pageInfo => isForwardSearch(pageInfo) ? pageInfo.endCursor : pageInfo.startCursor;
+
+const hasAnotherPage = pageInfo => isForwardSearch(pageInfo) ? pageInfo.hasNextPage : pageInfo.hasPreviousPage;
+
+const createIterator = octokit => {
+  return (query, initialParameters = {}) => {
+    let nextPageExists = true;
+    let parameters = { ...initialParameters
+    };
+    return {
+      [Symbol.asyncIterator]: () => ({
+        async next() {
+          if (!nextPageExists) return {
+            done: true,
+            value: {}
+          };
+          const response = await octokit.graphql(query, parameters);
+          const pageInfoContext = extractPageInfos(response);
+          const nextCursorValue = getCursorFrom(pageInfoContext.pageInfo);
+          nextPageExists = hasAnotherPage(pageInfoContext.pageInfo);
+
+          if (nextPageExists && nextCursorValue === parameters.cursor) {
+            throw new MissingCursorChange(pageInfoContext, nextCursorValue);
+          }
+
+          parameters = { ...parameters,
+            cursor: nextCursorValue
+          };
+          return {
+            done: false,
+            value: response
+          };
+        }
+
+      })
+    };
+  };
+};
+
+const mergeResponses = (response1, response2) => {
+  if (Object.keys(response1).length === 0) {
+    return Object.assign(response1, response2);
+  }
+
+  const path = findPaginatedResourcePath(response1);
+  const nodesPath = [...path, "nodes"];
+  const newNodes = get(response2, nodesPath);
+
+  if (newNodes) {
+    set(response1, nodesPath, values => {
+      return [...values, ...newNodes];
+    });
+  }
+
+  const edgesPath = [...path, "edges"];
+  const newEdges = get(response2, edgesPath);
+
+  if (newEdges) {
+    set(response1, edgesPath, values => {
+      return [...values, ...newEdges];
+    });
+  }
+
+  const pageInfoPath = [...path, "pageInfo"];
+  set(response1, pageInfoPath, get(response2, pageInfoPath));
+  return response1;
+};
+
+const createPaginate = octokit => {
+  const iterator = createIterator(octokit);
+  return async (query, initialParameters = {}) => {
+    let mergedResponse = {};
+
+    for await (const response of iterator(query, initialParameters)) {
+      mergedResponse = mergeResponses(mergedResponse, response);
+    }
+
+    return mergedResponse;
+  };
+};
+
+function paginateGraphql(octokit) {
+  octokit.graphql;
+  return {
+    graphql: Object.assign(octokit.graphql, {
+      paginate: Object.assign(createPaginate(octokit), {
+        iterator: createIterator(octokit)
+      })
+    })
+  };
+}
+
+exports.paginateGraphql = paginateGraphql;
+//# sourceMappingURL=index.js.map
 
 
 /***/ }),
